@@ -95,7 +95,7 @@ def evaluate(
 
             # Accumulate rewards for all agents
             for a in env.agents:
-                rewards[a] += env.rewards[a]
+                rewards[a] += float(env.rewards[a])
 
             if termination or truncation:
                 episode_lengths.append(step_count)
