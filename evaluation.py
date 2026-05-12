@@ -4,8 +4,13 @@
 Code used to load an agent and evaluate its performance.
 
 Usage:
-    python3 evaluation.py [-h] [--verbose | --quiet] [--load FILE] [--screen]
-                          [--episodes NUM] [--seed SEED] [--agents NUM] [--output FILE]
+    python3 evaluation.py [-h] [--verbose | --quiet]
+                          [--load FILE] [--screen]
+                          [--episodes NUM] [--seed SEED]
+                          [--episode-time-limit SECONDS]
+                          [--distortion LEVEL]
+                          [--output FILE] [--append]
+                          [--id ID] [--zombies]
 """
 
 import argparse
@@ -20,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pygame
-
 from utils import create_environment, iou
 
 logger = logging.getLogger("ml-project")
@@ -67,6 +71,7 @@ def evaluate(
     env: Any,
     predict_function: Callable,
     seeds: List[int],
+    episode_time_limit: int,
 ) -> Dict[str, float]:
     """
     Evaluate an agent's performance over multiple episodes.
@@ -81,7 +86,9 @@ def evaluate(
     """
     rewards = {agent: 0 for agent in env.possible_agents}
     episode_lengths = []
+    episode_end_reasons = []
     do_terminate = False
+
     start_time = time.time()
 
     for i, seed in enumerate(seeds):
@@ -89,21 +96,37 @@ def evaluate(
         env.action_space(env.possible_agents[0]).seed(seed)
         step_count = 0
 
+        episode_start_time = time.time()
+
         for agent in env.agent_iter():
             obs, reward, termination, truncation, info = env.last()
             step_count += 1
 
-            # Accumulate rewards for all agents
+            # Timeout check
+            if time.time() - episode_start_time > episode_time_limit:
+                logger.info(
+                    f"Episode {i + 1} timed out after {episode_time_limit} seconds"
+                )
+                episode_lengths.append(step_count)
+                episode_end_reasons.append("timeout")
+                break
+
+            # Accumulate rewards
             for a in env.agents:
                 rewards[a] += float(env.rewards[a])
 
-            if termination or truncation:
+            if termination:
                 episode_lengths.append(step_count)
+                episode_end_reasons.append("terminated")
+                break
+
+            if truncation:
+                episode_lengths.append(step_count)
+                episode_end_reasons.append("truncated")
                 break
 
             action = predict_function(obs, agent)
 
-            # Handle rendering and user input
             if env.render_mode == "human":
                 if handle_pygame_events():
                     do_terminate = True
@@ -122,20 +145,22 @@ def evaluate(
     env.close()
     total_time = time.time() - start_time
 
-    # Calculate statistics
-    avg_reward = sum(rewards.values()) / len(seeds)
+    completed_episodes = len(episode_lengths) if episode_lengths else 1
+
+    avg_reward = sum(rewards.values()) / completed_episodes
     avg_reward_per_agent = {
-        agent: rewards[agent] / len(seeds) for agent in env.possible_agents
+        agent: rewards[agent] / completed_episodes for agent in env.possible_agents
     }
 
     results = {
         "avg_reward": avg_reward,
         "avg_reward_per_agent": avg_reward_per_agent,
-        "total_episodes": len(seeds),
+        "total_episodes": completed_episodes,
         "avg_episode_length": np.mean(episode_lengths) if episode_lengths else 0,
         "evaluation_time": total_time,
-        "time_per_episode": total_time / len(seeds) if seeds else 0,
-        "used_seeds": seeds,
+        "time_per_episode": total_time / completed_episodes,
+        "used_seeds": seeds[:completed_episodes],
+        "episode_end_reasons": episode_end_reasons,
     }
 
     print("\nEvaluation Results:")
@@ -148,6 +173,11 @@ def evaluate(
     print(f"- Total evaluation time: {results['evaluation_time']:.2f} seconds")
     print(f"- Time per episode: {results['time_per_episode']:.2f} seconds")
 
+    from collections import Counter
+
+    counts = Counter(episode_end_reasons)
+    print(f"- Episode endings: {dict(counts)}")
+
     return results
 
 
@@ -157,16 +187,23 @@ def evaluate_zombies(predict_function):
     obs_files = list(obs_dir.glob("*_obs.npy"))
     precisions = []
     start_time = time.time()
+
     for i, obs_file in enumerate(obs_files):
-        zombies_file = obs_file.parent / obs_file.name.replace("_obs.npy", "_zombies.npy")
+        zombies_file = obs_file.parent / obs_file.name.replace(
+            "_obs.npy", "_zombies.npy"
+        )
         logger.info(f"Evaluating instance {i} ({obs_file.name}, {zombies_file.name})")
+
         if not zombies_file.exists():
             raise Exception(f"File missing: {zombies_file}")
+
         obs = np.load(obs_file)
         zombies_gt = np.load(zombies_file)
         zombies_pred = predict_function(obs)
+
         zombies_mask = np.zeros((zombies_gt.shape[0]), dtype=np.bool_)
         found = 0
+
         for zombie_pred in zombies_pred:
             for z_i, zombie_gt in enumerate(zombies_gt):
                 if zombies_mask[z_i]:
@@ -174,7 +211,9 @@ def evaluate_zombies(predict_function):
                 if iou(zombie_pred, zombie_gt) >= 0.5:
                     found += 1
                     zombies_mask[z_i] = True
+
         precisions.append(found / zombies_gt.shape[0])
+
     total_time = time.time() - start_time
     avgp = sum(precisions) / len(precisions)
 
@@ -194,16 +233,14 @@ def evaluate_zombies(predict_function):
     return results
 
 
-
 def handle_pygame_events() -> bool:
     """Handle pygame events and return True if user requested to quit."""
     events = pygame.event.get()
     for event in events:
         if event.type == pygame.QUIT:
             return True
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_q:
-                return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+            return True
     return False
 
 
@@ -286,6 +323,12 @@ def main(argv=None) -> int:
         action="store_true",
         help="Evaluate only the zombie detector",
     )
+    parser.add_argument(
+        "--episode-time-limit",
+        type=int,
+        default=240,
+        help="Max time per episode in seconds",
+    )
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose, args.quiet)
@@ -299,7 +342,9 @@ def main(argv=None) -> int:
     # Generate random seeds for episodes
     seeds = generate_random_seeds(args.episodes, args.seed)
     if not args.zombies:
-        logger.info(f"Evaluating with {args.episodes} episodes (master seed: {args.seed})")
+        logger.info(
+            f"Evaluating with {args.episodes} episodes (master seed: {args.seed})"
+        )
 
     # Load agent
     env_settings = {
@@ -327,19 +372,20 @@ def main(argv=None) -> int:
         return 1
 
     # Create and wrap environment
-    env = create_environment(
-        render_mode=render_mode,
-        **env_settings,
-    )
+    env = create_environment(render_mode=render_mode, **env_settings)
     env = CustomWrapper(env)
 
     if args.zombies:
         # Only evaluate the zombie detector
         results = evaluate_zombies(CustomZombieDetectorFunction(env))
-
     else:
         # Evaluate playing the game
-        results = evaluate(env, CustomPredictFunction(env), seeds=seeds)
+        results = evaluate(
+            env,
+            CustomPredictFunction(env),
+            seeds=seeds,
+            episode_time_limit=args.episode_time_limit,
+        )
 
     if args.output:
         save_results_to_jsonl(
