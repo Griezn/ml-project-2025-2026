@@ -138,14 +138,14 @@ To transfer files, use the `scp` command. This works in both Unix terminals and 
 **Copying local file TO remote:**
 
 ```bash
-scp -r ./my_code/ pcroom:/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/r0123456/
+scp -r ./my_code/ aalst.student.cs.kuleuven.be:/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/students/r0123456/
 
 ```
 
 **Copying remote file TO local:**
 
 ```bash
-scp pcroom:/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/r0123456/results.txt ./
+scp aalst.student.cs.kuleuven.be:/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/students/r0123456/results.txt ./
 
 ```
 
@@ -186,5 +186,5 @@ Accessible from all machines. *Check quota with `quota`.*
 **Local space:** `/tmp/`
 Fast, local storage on the specific machine you are using. Cleaned regularly. Use this for heavy datasets or logs during training, then move results to your home dir.
 
-**Course directory:** `/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/r0123456`
+**Course directory:** `/cw/lvs/NoCsBack/vakken/H0T25A/ml-project/students/r0123456`
 Your submission folder. Accessible from all machines (but not the login node). **Limit: 50MB.**
