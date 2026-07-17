@@ -11,6 +11,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 import torch
+import gymnasium
 from gymnasium import spaces
 from pettingzoo.utils import BaseWrapper
 from pettingzoo.utils.env import AgentID, ObsType
