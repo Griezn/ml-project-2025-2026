@@ -80,6 +80,7 @@ class CustomWrapper(BaseWrapper):
         self._penalized_termination = False
         self._last_yolo_frame = -1
         self._last_yolo_detections = np.zeros((0, 4))
+        self.raw_episode_returns = {agent: 0.0 for agent in self.possible_agents}
         return super().reset(seed=seed, options=options)
 
     def step(self, action):
@@ -88,61 +89,79 @@ class CustomWrapper(BaseWrapper):
 
         super().step(action)
 
+        # Track raw reward before shaping
+        if agent in self.rewards:
+            self.raw_episode_returns[agent] = self.raw_episode_returns.get(agent, 0.0) + self.rewards[agent]
+
         if self.shape_rewards and action is not None and agent in self.rewards:
             self._apply_unified_reward_shaping(agent, action, obs)
 
+        if self.terminations.get(agent, False) or self.truncations.get(agent, False):
+            if agent in self.infos:
+                self.infos[agent]["raw_return"] = self.raw_episode_returns.get(agent, 0.0)
+
     def _apply_unified_reward_shaping(self, agent, action, obs):
         """
-        Handles reward shaping cleanly and stably:
-        - Shooting alignment bonus (+0.10) if aimed at an aligned zombie.
-        - Gentle wasted shot penalty (-0.01) if shooting with no aligned zombies.
-        - Zombie bottom-line defense penalty (-0.05 per step) when zombies reach y > 0.75.
-        - Archer anti-clumping / spacing penalty (-0.03 per step) when teammates bunch up closer than 15% distance.
-        - Global breach/termination penalty (-5.0) upon episode death.
+        Potential-based shaping + real outcome rewards:
+        - Kill reward: sparse, large, tied to an actual zombie being removed by a hit.
+        - Distance-to-threat shaping: potential-based, so it only rewards *progress*,
+          not just occupying a "bad" state.
+        - Cooperative spacing: rewards *complementary coverage* instead of punishing proximity.
+        - Shot economy: mild penalty only for shooting with nothing in range at all
+          (not tied to alignment cone -> can't be farmed by fake-aiming).
+        - Global breach penalty unchanged.
         """
-        # 1. Parse Zombie & Teammate Features from Observation
-        any_aligned_zombie = False
-        zombie_near_bottom = False
+        raw = self.unwrapped
+        gamma = 0.99  # match your PPO discount
 
+        # --- 1. Kill detection: compare zombie count before/after, excluding bottom-reach removals
+        current_zombie_count = len(getattr(raw, "zombie_list", []))
+        prev_zombie_count = getattr(self, "_prev_zombie_count", current_zombie_count)
+        zombies_reached_bottom = getattr(self, "_zombies_reached_bottom_this_step", 0)
+
+        zombies_killed = max(0, prev_zombie_count - current_zombie_count - zombies_reached_bottom)
+        shaping_delta = zombies_killed * 1.0  # real, sparse, unambiguous signal
+
+        self._prev_zombie_count = current_zombie_count
+
+        # --- 2. Potential-based threat shaping (replaces flat -0.05 bottom-line penalty)
+        # Φ(s) = -max distance-to-bottom over visible zombies (higher Φ = safer state)
+        closest_zy = 0.0
         for i in range(5):
             base_idx = 10 + i * 7
             is_detected = obs[base_idx + 6]
             if is_detected > 0.5:
-                cos_diff = obs[base_idx + 3]
                 zy_norm = obs[base_idx + 5]
+                closest_zy = max(closest_zy, zy_norm)
+        phi_now = -closest_zy
 
-                if cos_diff > 0.70:
-                    any_aligned_zombie = True
+        phi_prev = getattr(self, "_prev_phi", phi_now)
+        shaping_delta += gamma * phi_now - phi_prev
+        self._prev_phi = phi_now
 
-                if zy_norm > 0.75:
-                    zombie_near_bottom = True
+        # --- 3. Shot economy: only penalize shooting with *nothing detected at all*
+        # (not "nothing in my narrow aim cone" -- that's what made aiming farmable)
+        if action == 4:
+            any_zombie_detected = any(
+                obs[10 + i * 7 + 6] > 0.5 for i in range(5)
+            )
+            if not any_zombie_detected:
+                shaping_delta -= 0.02
 
-        shaping_delta = 0.0
-
-        # 2. Shooting Action Incentives
-        if action == 4:  # Shoot action
-            if any_aligned_zombie:
-                shaping_delta += 0.10  # Moderate alignment reward
-            else:
-                shaping_delta -= 0.01  # Small penalty for wasted shot
-
-        # 3. Zombie Bottom-Line Defense Penalty
-        if zombie_near_bottom:
-            shaping_delta -= 0.05
-
-        # 4. Archer Anti-Clumping / Spacing Penalty
+        # --- 4. Cooperative spacing: reward *coverage*, don't punish proximity outright
+        # Only penalize clumping if BOTH archers are far from any threatened zombie
+        # (i.e. clumping while zombies are near bottom = bad; clumping while clearing early = fine)
         rel_team_x = obs[5]
         rel_team_y = obs[6]
         team_alive = obs[9]
-        if team_alive > 0.5:
-            team_dist = np.sqrt(rel_team_x**2 + rel_team_y**2)
-            if team_dist < 0.15:  # Teammates bunching up closer than 15% screen distance
-                shaping_delta -= 0.03
+        if team_alive > 0.5 and closest_zy > 0.6:  # only matters when there's real pressure
+            team_dist = np.sqrt(rel_team_x ** 2 + rel_team_y ** 2)
+            if team_dist < 0.15:
+                shaping_delta -= 0.02
 
-        # Apply individual shaping delta
         self.rewards[agent] += shaping_delta
 
-        # 5. One-Time Global Termination/Breach Penalty
+        # --- 5. Global termination penalty (unchanged, still fine as a one-off)
         if not getattr(self, "_penalized_termination", False):
             if any(self.terminations.values()):
                 self._penalized_termination = True

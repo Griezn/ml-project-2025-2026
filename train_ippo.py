@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import csv
+import argparse
 from datetime import datetime
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.algorithms.ppo.torch.ppo_torch_rl_module import PPOTorchRLModule
 from ray.rllib.core.rl_module import MultiRLModuleSpec, RLModuleSpec
 from ray.rllib.algorithms.algorithm import Algorithm
+from ray.rllib.callbacks.callbacks import RLlibCallback
 from pettingzoo.utils.conversions import aec_to_parallel
 
 from utils import create_environment
@@ -30,6 +32,18 @@ ENT_COEF = 0.01
 VAL_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 ROLLOUT_STEPS = 2048  # Total environment steps per policy update
+
+
+class CustomMetricsCallback(RLlibCallback):
+    def on_episode_end(self, *, episode, env_runner, metrics_logger, **kwargs):
+        if metrics_logger is not None and hasattr(episode, "get_infos"):
+            raw_returns = []
+            for agent_id, agent_infos in episode.get_infos().items():
+                for step_info in agent_infos:
+                    if isinstance(step_info, dict) and "raw_return" in step_info:
+                        raw_returns.append(step_info["raw_return"])
+            if raw_returns:
+                metrics_logger.log_value("raw_episode_return", sum(raw_returns) / len(raw_returns))
 
 
 def env_creator(config):
@@ -59,8 +73,6 @@ def find_latest_checkpoint(runs_dir="runs"):
     return candidates[0][0]
 
 
-import argparse
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Train IPPO Agent with RLlib")
     parser.add_argument("--max-updates", type=int, default=100, help="Number of training updates for fresh training or additional updates for restored run")
@@ -70,6 +82,7 @@ def parse_args():
     parser.add_argument("--ent-coef", type=float, default=0.05, help="Entropy coefficient for exploration")
     parser.add_argument("--restore-checkpoint", type=str, default=None, help="Path to checkpoint directory to restore from, or 'latest' / 'auto'")
     return parser.parse_args()
+
 
 def train(args=None):
     if args is None:
@@ -170,6 +183,7 @@ def train(args=None):
                 enable_env_runner_and_connector_v2=True,
             )
             .environment(env="knights_archers_zombies_v10_rllib", disable_env_checking=True)
+            .callbacks(CustomMetricsCallback)
             .env_runners(
                 num_env_runners=8,
                 rollout_fragment_length="auto"
@@ -222,7 +236,7 @@ def train(args=None):
         episodes = env_runners_stats.get("num_episodes_lifetime", 0)
         steps = result.get("num_env_steps_sampled_lifetime", 0)
         mean_shaped_return = env_runners_stats.get("episode_return_mean", 0.0)
-        mean_raw_return = mean_shaped_return
+        mean_raw_return = env_runners_stats.get("raw_episode_return", mean_shaped_return)
         
         actor_loss = learners_stats.get("policy_loss", 0.0)
         critic_loss = learners_stats.get("vf_loss", 0.0)
@@ -276,4 +290,3 @@ def train(args=None):
 
 if __name__ == "__main__":
     train()
-
