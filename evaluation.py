@@ -60,6 +60,8 @@ def save_results_to_jsonl(
         if agent_id:
             result_data["agent"] = agent_id
 
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+
         with open(output_file, mode, encoding="utf-8") as f:
             f.write(json.dumps(result_data) + "\n")
         logger.info(f"Results saved to {output_file}")
