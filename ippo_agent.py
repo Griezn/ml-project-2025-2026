@@ -14,79 +14,6 @@ from ultralytics import YOLO
 OBS_DIM = 45  # 5 (own) + 5 (teammate) + 35 (5 zombies * 7 features)
 ACTION_DIM = 6
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int = OBS_DIM, action_dim: int = ACTION_DIM):
-        super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, action_dim)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, obs: torch.Tensor):
-        logits = self.actor(obs)
-        value = self.critic(obs)
-        return logits, value
-
-
-def shape_reward(agent_obs, action, raw_reward):
-    """
-    Shaped reward to guide exploration:
-    - survival cost
-    - reward shooting while facing a close zombie
-    - penalty for shooting when no zombie is nearby or in sight
-    - penalty if zombies get close to the bottom
-    """
-    shaped = float(raw_reward)
-    
-    # Parse zombie features:
-    # 5 zombies (indices 10..44): rel_zx, rel_zy, norm_dist, cos_diff, sin_diff, zy / 720.0, is_detected
-    closest_dist = 1.0
-    closest_cos = -1.0
-    closest_y = 0.0
-    found_zombie = False
-    
-    for i in range(5):
-        base_idx = 10 + i * 7
-        is_detected = agent_obs[base_idx + 6]
-        if is_detected > 0.5:
-            dist = agent_obs[base_idx + 2]
-            cos_diff = agent_obs[base_idx + 3]
-            zy = agent_obs[base_idx + 5]
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_cos = cos_diff
-                closest_y = zy
-                found_zombie = True
-                
-    # If we shoot (action 4)
-    if action == 4:
-        if found_zombie:
-            if closest_cos > 0.8:
-                shaped += 0.1  # Reward for shooting while facing a zombie
-            else:
-                shaped -= 0.02 # Penalty for shooting in the wrong direction
-        else:
-            shaped -= 0.05 # Penalty for shooting with no zombies
-            
-    # Small survival penalty to encourage faster clears
-    shaped -= 0.005
-    
-    # Penalty if zombie is getting close to the bottom line
-    if found_zombie and closest_y > 0.85:
-        shaped -= 0.05
-        
-    return shaped
-
 
 class CustomWrapper(BaseWrapper):
     def __init__(self, env):
@@ -112,8 +39,20 @@ class CustomWrapper(BaseWrapper):
                 "best.pt"
             )
         
-        # Initialize YOLO model on CPU/GPU
+        # Select best available hardware device (MPS for Apple Silicon GPU, CUDA, or CPU)
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+
+        # Initialize YOLO model on selected device
         self.yolo_model = YOLO(weights_path)
+        try:
+            self.yolo_model.to(self.device)
+        except Exception:
+            pass
         
         # Cache for YOLO detections to prevent redundant runs for multiple agents at the same frame
         self._last_yolo_frame = -1
@@ -123,17 +62,94 @@ class CustomWrapper(BaseWrapper):
         self.use_yolo = True
         self.shape_rewards = False
 
+        # Locate VisualWrapper in wrapper stack and bypass heavy frame rendering/distortion during training
+        curr = self.env
+        while curr is not None:
+            if hasattr(curr, "_refresh_transformed_frame"):
+                orig_refresh = curr._refresh_transformed_frame
+                wrapper_ref = self
+                def fast_refresh(force=False, orig_ref=orig_refresh):
+                    if wrapper_ref.use_yolo:
+                        return orig_ref(force=force)
+                    return
+                curr._refresh_transformed_frame = fast_refresh
+                break
+            curr = getattr(curr, "env", None)
+
+    def reset(self, seed=None, options=None):
+        self._penalized_termination = False
+        self._last_yolo_frame = -1
+        self._last_yolo_detections = np.zeros((0, 4))
+        return super().reset(seed=seed, options=options)
+
     def step(self, action):
         agent = self.env.agent_selection
-        # Get agent observation before step modifies environment state
         obs = self.observe(agent)
-        
+
         super().step(action)
-        
+
         if self.shape_rewards and action is not None and agent in self.rewards:
-            raw_reward = self.rewards[agent]
-            shaped = shape_reward(obs, action, raw_reward)
-            self.rewards[agent] = shaped
+            self._apply_unified_reward_shaping(agent, action, obs)
+
+    def _apply_unified_reward_shaping(self, agent, action, obs):
+        """
+        Handles reward shaping cleanly and stably:
+        - Shooting alignment bonus (+0.10) if aimed at an aligned zombie.
+        - Gentle wasted shot penalty (-0.01) if shooting with no aligned zombies.
+        - Zombie bottom-line defense penalty (-0.05 per step) when zombies reach y > 0.75.
+        - Archer anti-clumping / spacing penalty (-0.03 per step) when teammates bunch up closer than 15% distance.
+        - Global breach/termination penalty (-5.0) upon episode death.
+        """
+        # 1. Parse Zombie & Teammate Features from Observation
+        any_aligned_zombie = False
+        zombie_near_bottom = False
+
+        for i in range(5):
+            base_idx = 10 + i * 7
+            is_detected = obs[base_idx + 6]
+            if is_detected > 0.5:
+                cos_diff = obs[base_idx + 3]
+                zy_norm = obs[base_idx + 5]
+
+                if cos_diff > 0.70:
+                    any_aligned_zombie = True
+
+                if zy_norm > 0.75:
+                    zombie_near_bottom = True
+
+        shaping_delta = 0.0
+
+        # 2. Shooting Action Incentives
+        if action == 4:  # Shoot action
+            if any_aligned_zombie:
+                shaping_delta += 0.10  # Moderate alignment reward
+            else:
+                shaping_delta -= 0.01  # Small penalty for wasted shot
+
+        # 3. Zombie Bottom-Line Defense Penalty
+        if zombie_near_bottom:
+            shaping_delta -= 0.05
+
+        # 4. Archer Anti-Clumping / Spacing Penalty
+        rel_team_x = obs[5]
+        rel_team_y = obs[6]
+        team_alive = obs[9]
+        if team_alive > 0.5:
+            team_dist = np.sqrt(rel_team_x**2 + rel_team_y**2)
+            if team_dist < 0.15:  # Teammates bunching up closer than 15% screen distance
+                shaping_delta -= 0.03
+
+        # Apply individual shaping delta
+        self.rewards[agent] += shaping_delta
+
+        # 5. One-Time Global Termination/Breach Penalty
+        if not getattr(self, "_penalized_termination", False):
+            if any(self.terminations.values()):
+                self._penalized_termination = True
+                for a in self.agents:
+                    if a in self.rewards:
+                        self.rewards[a] -= 5.0
+
 
     def observation_space(self, agent: AgentID):
         # We return a 45-dimensional vector:
@@ -148,10 +164,6 @@ class CustomWrapper(BaseWrapper):
         )
 
     def observe(self, agent: AgentID) -> ObsType | None:
-        raw_obs = super().observe(agent)  # Shape (720, 1280, 3)
-        if raw_obs is None:
-            return np.zeros(OBS_DIM, dtype=np.float32)
-            
         raw = self.unwrapped
         
         # Get frame count for caching
@@ -160,22 +172,37 @@ class CustomWrapper(BaseWrapper):
         # Update cache if it is a new frame
         if self._last_yolo_frame != current_frame:
             if self.use_yolo:
-                results = self.yolo_model(raw_obs, verbose=False)
-                zombie_rects = []
-                if len(results) > 0:
-                    for box in results[0].boxes:
-                        xyxy = box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
-                        x1, y1, x2, y2 = xyxy
-                        w = x2 - x1
-                        h = y2 - y1
-                        zombie_rects.append([x1, y1, w, h])
-                self._last_yolo_detections = np.array(zombie_rects) if zombie_rects else np.zeros((0, 4))
+                raw_obs = super().observe(agent)  # Shape (720, 1280, 3)
+                if raw_obs is None:
+                    return np.zeros(OBS_DIM, dtype=np.float32)
+                # Run YOLO every 2 frames or if initial detection
+                if self._last_yolo_frame == -1 or (current_frame - self._last_yolo_frame) >= 2 or len(self._last_yolo_detections) == 0:
+                    import cv2
+                    # Fast OpenCV resize to 640x360 before PyTorch tensor conversion
+                    small_obs = cv2.resize(raw_obs, (640, 360))
+                    with torch.no_grad():
+                        results = self.yolo_model(small_obs, verbose=False, device=self.device, imgsz=320)
+                    zombie_rects = []
+                    if len(results) > 0 and results[0].boxes is not None:
+                        boxes = results[0].boxes.xyxy.cpu().numpy()
+                        for box in boxes:
+                            # Scale bounding boxes back to 1280x720 coordinate space
+                            x1, y1, x2, y2 = box[:4]
+                            x1 *= 2.0
+                            y1 *= 2.0
+                            x2 *= 2.0
+                            y2 *= 2.0
+                            w = x2 - x1
+                            h = y2 - y1
+                            zombie_rects.append([x1, y1, w, h])
+                    self._last_yolo_detections = np.array(zombie_rects) if zombie_rects else np.zeros((0, 4))
+                    self._last_yolo_frame = current_frame
             else:
                 zombie_rects = []
-                for z in raw.zombie_list:
+                for z in getattr(raw, "zombie_list", []):
                     zombie_rects.append([z.rect.x, z.rect.y, z.rect.width, z.rect.height])
                 self._last_yolo_detections = np.array(zombie_rects) if zombie_rects else np.zeros((0, 4))
-            self._last_yolo_frame = current_frame
+                self._last_yolo_frame = current_frame
             
         # Get own agent information
         archer_key = agent.replace("_", "")  # "archer0" or "archer1"
@@ -263,28 +290,43 @@ class CustomWrapper(BaseWrapper):
 
 class CustomPredictFunction(Callable):
     def __init__(self, env):
-        # Load weights from policy checkpoint
+        # Load MultiRLModule from the saved RLlib module checkpoint
         package_directory = os.path.dirname(os.path.abspath(__file__))
-        weights_path = os.path.join(package_directory, "runs", "ippo_policy.pt")
+        checkpoint_dir = os.path.join(package_directory, "runs", "ippo_rllib_module")
         
         self.device = torch.device("cpu")
-        self.policy = ActorCritic(obs_dim=OBS_DIM, action_dim=ACTION_DIM).to(self.device)
         
-        if os.path.exists(weights_path):
-            self.policy.load_state_dict(torch.load(weights_path, map_location=self.device))
-            self.policy.eval()
-            print(f"Successfully loaded iPPO policy weights from {weights_path}")
+        if os.path.exists(checkpoint_dir):
+            from ray.rllib.core.rl_module import MultiRLModule
+            try:
+                self.modules = MultiRLModule.from_checkpoint(checkpoint_dir)
+                if "shared_policy" in self.modules:
+                    self.policy = self.modules["shared_policy"].to(self.device)
+                else:
+                    first_policy_id = list(self.modules.keys())[0]
+                    self.policy = self.modules[first_policy_id].to(self.device)
+                self.policy.eval()
+                print(f"Successfully loaded RLlib policy from {checkpoint_dir}")
+            except Exception as e:
+                print(f"Error loading RLlib module checkpoint: {e}")
+                self.policy = None
         else:
-            print(f"Warning: policy weights not found at {weights_path}. Running with random/untrained weights.")
-            self.policy.eval()
+            print(f"Warning: RLlib module checkpoint not found at {checkpoint_dir}. Running with random/untrained weights.")
+            self.policy = None
 
     def __call__(self, observation, agent, *args, **kwargs):
-        # Make a forward pass through the loaded policy
+        if self.policy is None:
+            # Fallback random action
+            return random.randint(0, ACTION_DIM - 1)
+            
+        # Make a forward pass through the loaded RLlib policy module
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+        fwd_ins = {"obs": obs_tensor}
         with torch.no_grad():
-            logits, _ = self.policy(obs_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            action = torch.argmax(probs, dim=-1).item()
+            fwd_outputs = self.policy.forward_inference(fwd_ins)
+            action_dist_class = self.policy.get_inference_action_dist_cls()
+            action_dist = action_dist_class.from_logits(fwd_outputs["action_dist_inputs"])
+            action = action_dist.sample()[0].item()
         return action
 
 
@@ -308,16 +350,27 @@ class CustomZombieDetectorFunction(Callable):
                 "weights",
                 "best.pt"
             )
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
         self.model = YOLO(weights_path)
+        try:
+            self.model.to(self.device)
+        except Exception:
+            pass
 
     def __call__(self, observation, *args, **kwargs):
         # Observation is HWC (720, 1280, 3)
-        results = self.model(observation, verbose=False)
+        with torch.no_grad():
+            results = self.model(observation, verbose=False, device=self.device, imgsz=416)
         zombie_rects = []
-        if len(results) > 0:
-            for box in results[0].boxes:
-                xyxy = box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
-                x1, y1, x2, y2 = xyxy
+        if len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            for box in boxes:
+                x1, y1, x2, y2 = box[:4]
                 w = x2 - x1
                 h = y2 - y1
                 zombie_rects.append([x1, y1, w, h])
