@@ -185,7 +185,7 @@ def train(args=None):
             .environment(env="knights_archers_zombies_v10_rllib", disable_env_checking=True)
             .callbacks(CustomMetricsCallback)
             .env_runners(
-                num_env_runners=8,
+                num_env_runners=6,
                 rollout_fragment_length="auto"
             )
             .multi_agent(

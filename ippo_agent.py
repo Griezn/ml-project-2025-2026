@@ -80,6 +80,8 @@ class CustomWrapper(BaseWrapper):
         self._penalized_termination = False
         self._last_yolo_frame = -1
         self._last_yolo_detections = np.zeros((0, 4))
+        self._prev_phi_dict = {}
+        self._prev_phi_aim_dict = {}
         self.raw_episode_returns = {agent: 0.0 for agent in self.possible_agents}
         return super().reset(seed=seed, options=options)
 
@@ -106,13 +108,13 @@ class CustomWrapper(BaseWrapper):
         - Kill reward: sparse, large, tied to an actual zombie being removed by a hit.
         - Distance-to-threat shaping: potential-based, so it only rewards *progress*,
           not just occupying a "bad" state.
+        - Aim-progress shaping: potential-based alignment to the single nearest zombie.
         - Cooperative spacing: rewards *complementary coverage* instead of punishing proximity.
-        - Shot economy: mild penalty only for shooting with nothing in range at all
-          (not tied to alignment cone -> can't be farmed by fake-aiming).
-        - Global breach penalty unchanged.
+        - Shot economy: mild penalty only for shooting with nothing in range at all.
+        - Global breach penalty.
         """
         raw = self.unwrapped
-        gamma = 0.99  # match your PPO discount
+        gamma = 0.99  # match PPO discount factor
 
         # --- 1. Kill detection: compare zombie count before/after, excluding bottom-reach removals
         current_zombie_count = len(getattr(raw, "zombie_list", []))
@@ -120,11 +122,11 @@ class CustomWrapper(BaseWrapper):
         zombies_reached_bottom = getattr(self, "_zombies_reached_bottom_this_step", 0)
 
         zombies_killed = max(0, prev_zombie_count - current_zombie_count - zombies_reached_bottom)
-        shaping_delta = zombies_killed * 1.0  # real, sparse, unambiguous signal
+        shaping_delta = zombies_killed * 3.0  # real, sparse, unambiguous signal
 
         self._prev_zombie_count = current_zombie_count
 
-        # --- 2. Potential-based threat shaping (replaces flat -0.05 bottom-line penalty)
+        # --- 2. Potential-based threat shaping
         # Φ(s) = -max distance-to-bottom over visible zombies (higher Φ = safer state)
         closest_zy = 0.0
         for i in range(5):
@@ -135,22 +137,44 @@ class CustomWrapper(BaseWrapper):
                 closest_zy = max(closest_zy, zy_norm)
         phi_now = -closest_zy
 
-        phi_prev = getattr(self, "_prev_phi", phi_now)
+        prev_phi_dict = getattr(self, "_prev_phi_dict", {})
+        phi_prev = prev_phi_dict.get(agent, phi_now)
         shaping_delta += gamma * phi_now - phi_prev
-        self._prev_phi = phi_now
+        prev_phi_dict[agent] = phi_now
+        self._prev_phi_dict = prev_phi_dict
 
-        # --- 3. Shot economy: only penalize shooting with *nothing detected at all*
-        # (not "nothing in my narrow aim cone" -- that's what made aiming farmable)
+        # --- 3. Potential-based aim progress shaping (aimed at the single nearest zombie)
+        nearest_cos_diff = 0.0
+        best_dist = np.inf
+        for i in range(5):
+            base_idx = 10 + i * 7
+            is_detected = obs[base_idx + 6]
+            if is_detected > 0.5:
+                norm_dist = obs[base_idx + 2]
+                if norm_dist < best_dist:
+                    best_dist = norm_dist
+                    nearest_cos_diff = obs[base_idx + 3]
+
+        phi_aim_now = nearest_cos_diff  # in [-1, 1], higher = better aligned to nearest threat
+        prev_aim_dict = getattr(self, "_prev_phi_aim_dict", {})
+        phi_aim_prev = prev_aim_dict.get(agent, phi_aim_now)
+        shaping_delta += 0.3 * (gamma * phi_aim_now - phi_aim_prev)
+        prev_aim_dict[agent] = phi_aim_now
+        self._prev_phi_aim_dict = prev_aim_dict
+
+        # --- 4. Shot economy: only penalize shooting with *nothing detected at all*
         if action == 4:
             any_zombie_detected = any(
                 obs[10 + i * 7 + 6] > 0.5 for i in range(5)
             )
             if not any_zombie_detected:
                 shaping_delta -= 0.02
+        elif action != 4 and not any(obs[10 + i * 7 + 6] > 0.5 for i in range(5)):
+            pass  # no zombies visible at all -- don't penalize scanning
+        elif action != 4:
+            shaping_delta -= 0.005  # tiny cost for disengaging while threats are visible
 
-        # --- 4. Cooperative spacing: reward *coverage*, don't punish proximity outright
-        # Only penalize clumping if BOTH archers are far from any threatened zombie
-        # (i.e. clumping while zombies are near bottom = bad; clumping while clearing early = fine)
+        # --- 5. Cooperative spacing: reward *coverage*, don't punish proximity outright
         rel_team_x = obs[5]
         rel_team_y = obs[6]
         team_alive = obs[9]
@@ -167,7 +191,7 @@ class CustomWrapper(BaseWrapper):
                 self._penalized_termination = True
                 for a in self.agents:
                     if a in self.rewards:
-                        self.rewards[a] -= 5.0
+                        self.rewards[a] -= 2.0
 
 
     def observation_space(self, agent: AgentID):
