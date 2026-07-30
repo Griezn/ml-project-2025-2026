@@ -1,0 +1,41 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{graphicx}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\usepackage{siunitx}
+
+\title{Machine Learning: Project (H0T25a)\\ \normalsize Multi-Agent Learning in Canonical Games and Knights Archers Zombies}
+\author{Seppe Degryse (r0954834)}
+\date{Academic Year 2025 -- 2026}
+
+\begin{document}
+\maketitle
+
+\section{Zombie Detection}
+
+
+\begin{table}[htpb]
+    \centering
+    \begin{tabular}{l | c | c | c}
+        \hline
+        Distortion Level & AP @ IoU 0.5 2 & AP @ IoU 0.75 & Mean IoU \\
+        \hline
+        \textbf{Level d0 ($n=39$)} & $100\%$ & $100\%$ & $0.9755$ \\
+        \textbf{Level d1 ($n=19$)} & $100\%$ & $100\%$ & $0.9703$ \\
+        \textbf{Level d2 ($n=32$)} & $100\%$ & $100\%$ & $0.9741$ \\
+        \textbf{Level d3 ($n=11$)} & $95.45\%$ & $95.45\%$ & $0.9506$ \\
+        \textbf{Level d4 ($n=47$)} & $100\%$ & $99.47\%$ & $0.9568$ \\
+        \textbf{Level d5 ($n=75$)} & $100\%$ & $94.33\%$ & $0.8755$ \\
+    \end{tabular}
+    \caption{Zombie detection precision across distortion levels}
+    \label{tab:label}
+\end{table}
+
+
+
+
+\end{document}
