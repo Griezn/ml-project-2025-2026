@@ -11,3 +11,4 @@ gputil
 stable-baselines3
 matplotlib
 pillow
+ultralytics

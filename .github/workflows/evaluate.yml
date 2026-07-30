@@ -1,0 +1,56 @@
+name: Evaluate Submission
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  evaluate:
+    name: Run Submission Evaluation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify Submission & Model Files
+        run: |
+          echo "=== Checking Submission Files & Checkpoints ==="
+          test -f submission.py || (echo "ERROR: submission.py missing!" && exit 1)
+          test -f ippo_agent.py || (echo "ERROR: ippo_agent.py missing!" && exit 1)
+          
+          if [ ! -d "runs/ippo_rllib_module" ]; then
+            echo "WARNING: runs/ippo_rllib_module directory missing or not committed!"
+          fi
+
+          echo "File verification check complete."
+
+      - name: Run Game Evaluation (3 Episodes)
+        run: |
+          mkdir -p runs/eval_ci
+          python evaluation.py --load submission.py --episodes 3 --output runs/eval_ci/results.jsonl --id ci_test
+
+      - name: Run Zombie Detector Evaluation
+        run: |
+          python evaluation.py --load submission.py --zombies
+
+      - name: Upload Evaluation Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-results
+          path: runs/eval_ci/
