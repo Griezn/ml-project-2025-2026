@@ -386,6 +386,9 @@ class CustomZombieDetectorFunction(Callable):
         if isinstance(img, torch.Tensor):
             img = img.cpu().numpy()
 
+        if img.ndim == 1:
+            img = img.reshape(720, 1280, 3)
+
         while len(img.shape) > 3:
             img = img[0]
 

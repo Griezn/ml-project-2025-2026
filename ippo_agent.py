@@ -406,9 +406,12 @@ class CustomZombieDetectorFunction(Callable):
             pass
 
     def __call__(self, observation, *args, **kwargs):
-        # Observation is HWC (720, 1280, 3)
+        # Observation may arrive flat (2764800,) and needs reshaping to HWC (720, 1280, 3)
+        img_arr = observation
+        if isinstance(img_arr, np.ndarray) and img_arr.ndim == 1:
+            img_arr = img_arr.reshape(720, 1280, 3)
         with torch.no_grad():
-            results = self.model(observation, verbose=False, device=self.device, imgsz=416)
+            results = self.model(img_arr, verbose=False, device=self.device, imgsz=416)
         zombie_rects = []
         if len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
